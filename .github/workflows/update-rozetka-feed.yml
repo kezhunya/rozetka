@@ -49,7 +49,7 @@ jobs:
         run: |
           python needs_refresh.py --controls-csv controls.csv \
             --state-json previous_state.json --decision-json decision.json \
-            --max-age-hours 3
+            --max-age-hours 24
 
       - name: Download full source feed
         if: steps.decision.outputs.run == 'true'
