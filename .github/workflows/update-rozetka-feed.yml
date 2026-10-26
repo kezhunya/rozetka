@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '4,9,14,19,24,29,34,39,44,49,54,59 * * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the sheet marker is unchanged
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -46,6 +51,8 @@ jobs:
 
       - name: Decide whether the feed must be rebuilt
         id: decision
+        env:
+          ROZETKA_FORCE_REFRESH: ${{ inputs.force }}
         run: |
           python needs_refresh.py --controls-csv controls.csv \
             --state-json previous_state.json --decision-json decision.json \
