@@ -19,7 +19,7 @@ jobs:
     env:
       SOURCE_XML_URL: https://aqua-favorit.com.ua/marketplace-integration/rozetka-feed/
       CONTROL_CSV_URL: https://docs.google.com/spreadsheets/d/e/2PACX-1vRLBoQ63DdiKn16Yanq1IsJfV9DWvMHczn9OrAt2oZK352JRBvbZS6eW-_pp_G1DMDB64UGp4Z8KZl3/pub?gid=1710262027&single=true&output=csv
-      PUBLIC_R2_BASE: https://pub-5cbcc03ea2904d7e958b783d9ac50c66.r2.dev
+      PUBLIC_R2_BASE: https://feeds.aqua-favorit.com.ua
       R2_OBJECT_KEY: aquafavorit_rozetka.xml
       R2_STATE_KEY: aquafavorit_rozetka.state.json
 
