@@ -1,0 +1,117 @@
+name: Publish Aqua-Favorit Rozetka XML
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aquafavorit-rozetka-r2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SOURCE_XML_URL: https://aqua-favorit.com.ua/marketplace-integration/rozetka-feed/
+      CONTROL_CSV_URL: https://docs.google.com/spreadsheets/d/e/2PACX-1vRLBoQ63DdiKn16Yanq1IsJfV9DWvMHczn9OrAt2oZK352JRBvbZS6eW-_pp_G1DMDB64UGp4Z8KZl3/pub?gid=1710262027&single=true&output=csv
+      PUBLIC_R2_BASE: https://pub-5cbcc03ea2904d7e958b783d9ac50c66.r2.dev
+      R2_OBJECT_KEY: aquafavorit_rozetka.xml
+      R2_STATE_KEY: aquafavorit_rozetka.state.json
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Read control sheet and prior publication state
+        run: |
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 10 \
+            --max-time 180 "$CONTROL_CSV_URL" --output controls.csv
+          test "$(wc -c < controls.csv)" -ge 1000000
+          state_code=$(curl --location --silent --show-error --max-time 30 \
+            --output previous_state.json --write-out '%{http_code}' \
+            "$PUBLIC_R2_BASE/$R2_STATE_KEY")
+          if [ "$state_code" = 404 ]; then
+            printf '{}\n' > previous_state.json
+          elif [ "$state_code" != 200 ]; then
+            echo "Cannot read R2 state: HTTP $state_code"
+            exit 1
+          fi
+
+      - name: Decide whether the feed must be rebuilt
+        id: decision
+        run: |
+          python needs_refresh.py --controls-csv controls.csv \
+            --state-json previous_state.json --decision-json decision.json \
+            --max-age-hours 3
+
+      - name: Download full source feed
+        if: steps.decision.outputs.run == 'true'
+        run: |
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 20 \
+            --max-time 1200 "$SOURCE_XML_URL" --output source.xml
+          test "$(wc -c < source.xml)" -ge 180000000
+
+      - name: Render and validate complete XML
+        if: steps.decision.outputs.run == 'true'
+        run: |
+          python render_feed.py --source source.xml --controls-csv controls.csv \
+            --output aquafavorit_rozetka.xml > render_stats.json
+          python -c 'import json; s=json.load(open("render_stats.json")); assert s["offers"] >= 40000 and s["controlled_offers"] >= 30000, s'
+          test "$(wc -c < aquafavorit_rozetka.xml)" -ge 180000000
+
+      - name: Install R2 client
+        if: steps.decision.outputs.run == 'true'
+        run: python -m pip install awscli
+
+      - name: Publish only new Rozetka objects
+        if: steps.decision.outputs.run == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+        run: |
+          for key in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY CF_R2_ACCOUNT_ID CF_R2_BUCKET_NAME; do
+            if [ -z "${!key}" ]; then
+              echo "Missing GitHub Actions secret: $key"
+              exit 1
+            fi
+          done
+          endpoint="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp aquafavorit_rozetka.xml "s3://${CF_R2_BUCKET_NAME}/${R2_OBJECT_KEY}" \
+            --endpoint-url "$endpoint" --no-progress \
+            --content-type 'application/xml; charset=utf-8' \
+            --cache-control 'no-store, max-age=0'
+          remote_size=$(aws s3api head-object --bucket "$CF_R2_BUCKET_NAME" \
+            --key "$R2_OBJECT_KEY" --endpoint-url "$endpoint" \
+            --query ContentLength --output text)
+          local_size=$(wc -c < aquafavorit_rozetka.xml)
+          test "$remote_size" -eq "$local_size"
+          python - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          decision = json.load(open('decision.json', encoding='utf-8'))
+          stats = json.load(open('render_stats.json', encoding='utf-8'))
+          state = {
+              'generated_at': datetime.now(timezone.utc).isoformat(),
+              'refresh_token': decision['refresh_token'],
+              'offers': stats['offers'],
+              'controlled_offers': stats['controlled_offers'],
+              'bytes': stats['bytes'],
+          }
+          with open('publication_state.json', 'w', encoding='utf-8') as stream:
+              json.dump(state, stream, ensure_ascii=False)
+          PY
+          aws s3 cp publication_state.json "s3://${CF_R2_BUCKET_NAME}/${R2_STATE_KEY}" \
+            --endpoint-url "$endpoint" --no-progress \
+            --content-type 'application/json; charset=utf-8' \
+            --cache-control 'no-store, max-age=0'
+          echo "Published $remote_size bytes to $PUBLIC_R2_BASE/$R2_OBJECT_KEY"
