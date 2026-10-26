@@ -39,7 +39,8 @@ def main() -> None:
     except (KeyError, TypeError, ValueError):
         generated_at = datetime.min.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
-    forced = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    forced = (os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+              and os.environ.get("ROZETKA_FORCE_REFRESH", "true").lower() == "true")
     marker_changed = token != state.get("refresh_token")
     expired = now - generated_at >= timedelta(hours=args.max_age_hours)
     decision = {
