@@ -132,7 +132,7 @@ jobs:
           echo "Published $remote_size bytes to $PUBLIC_R2_BASE/$R2_OBJECT_KEY"
 
       - name: Report result for the control sheet
-        if: always()
+        if: always() && (steps.decision.outputs.run == 'true' || failure())
         env:
           JOB_RESULT: ${{ job.status }}
           STEP_CHECKOUT: ${{ steps.checkout.outcome }}
