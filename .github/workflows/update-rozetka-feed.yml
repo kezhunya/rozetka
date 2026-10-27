@@ -27,14 +27,18 @@ jobs:
       PUBLIC_R2_BASE: https://feeds.aqua-favorit.com.ua
       R2_OBJECT_KEY: aquafavorit_rozetka.xml
       R2_STATE_KEY: aquafavorit_rozetka.state.json
+      R2_HEALTH_KEY: aquafavorit_rozetka.health.json
 
     steps:
       - uses: actions/checkout@v4
+        id: checkout
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: '3.12'
 
       - name: Read control sheet and prior publication state
+        id: controls
         run: |
           curl --fail --location --silent --show-error --retry 4 --retry-delay 10 \
             --max-time 180 "$CONTROL_CSV_URL" --output controls.csv
@@ -59,6 +63,7 @@ jobs:
             --max-age-hours 24
 
       - name: Download full source feed
+        id: download
         if: steps.decision.outputs.run == 'true'
         run: |
           curl --fail --location --silent --show-error --retry 4 --retry-delay 20 \
@@ -66,6 +71,7 @@ jobs:
           test "$(wc -c < source.xml)" -ge 180000000
 
       - name: Render and validate complete XML
+        id: render
         if: steps.decision.outputs.run == 'true'
         run: |
           python render_feed.py --source source.xml --controls-csv controls.csv \
@@ -74,10 +80,12 @@ jobs:
           test "$(wc -c < aquafavorit_rozetka.xml)" -ge 180000000
 
       - name: Install R2 client
+        id: install_r2
         if: steps.decision.outputs.run == 'true'
         run: python -m pip install awscli
 
       - name: Publish only new Rozetka objects
+        id: publish_r2
         if: steps.decision.outputs.run == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
@@ -122,3 +130,66 @@ jobs:
             --content-type 'application/json; charset=utf-8' \
             --cache-control 'no-store, max-age=0'
           echo "Published $remote_size bytes to $PUBLIC_R2_BASE/$R2_OBJECT_KEY"
+
+      - name: Report result for the control sheet
+        if: always()
+        env:
+          JOB_RESULT: ${{ job.status }}
+          STEP_CHECKOUT: ${{ steps.checkout.outcome }}
+          STEP_PYTHON: ${{ steps.python.outcome }}
+          STEP_CONTROLS: ${{ steps.controls.outcome }}
+          STEP_DECISION: ${{ steps.decision.outcome }}
+          STEP_DOWNLOAD: ${{ steps.download.outcome }}
+          STEP_RENDER: ${{ steps.render.outcome }}
+          STEP_INSTALL_R2: ${{ steps.install_r2.outcome }}
+          STEP_PUBLISH_R2: ${{ steps.publish_r2.outcome }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+        run: |
+          python -m pip install --quiet awscli
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          stages = [
+              ('checkout', 'Получение кода'),
+              ('python', 'Подготовка Python'),
+              ('controls', 'Чтение таблицы и состояния фида'),
+              ('decision', 'Решение об обновлении'),
+              ('download', 'Загрузка исходного XML'),
+              ('render', 'Расчёт и проверка итогового XML'),
+              ('install_r2', 'Подготовка клиента R2'),
+              ('publish_r2', 'Публикация в R2'),
+          ]
+          failed = next(((key, title) for key, title in stages
+                         if os.getenv('STEP_' + key.upper()) == 'failure'), None)
+          result = 'success' if os.environ['JOB_RESULT'] == 'success' else 'failure'
+          stage = failed[1] if failed else ('Неизвестный этап' if result == 'failure' else '')
+          descriptions = {
+              'controls': 'Не удалось прочитать таблицу или текущее состояние R2.',
+              'decision': 'Не удалось сравнить запрос с опубликованным фидом.',
+              'download': 'Не удалось скачать исходный XML сайта либо его размер меньше 180 МБ.',
+              'render': 'Ошибка расчёта, проверки XML или количества товаров.',
+              'install_r2': 'Не удалось подготовить клиент R2.',
+              'publish_r2': 'Не удалось записать или проверить XML и состояние в R2.',
+          }
+          report = {
+              'checked_at': datetime.now(timezone.utc).isoformat(),
+              'result': result,
+              'stage': stage,
+              'message': descriptions.get(failed[0], 'Откройте журнал запуска для деталей.')
+                         if failed else '',
+              'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          with open('publication_health.json', 'w', encoding='utf-8') as stream:
+              json.dump(report, stream, ensure_ascii=False)
+          PY
+          endpoint="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp publication_health.json "s3://${CF_R2_BUCKET_NAME}/${R2_HEALTH_KEY}" \
+            --endpoint-url "$endpoint" --no-progress \
+            --content-type 'application/json; charset=utf-8' \
+            --cache-control 'no-store, max-age=0'
