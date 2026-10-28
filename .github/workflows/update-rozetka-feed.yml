@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       SOURCE_XML_URL: https://aqua-favorit.com.ua/marketplace-integration/rozetka-feed/
@@ -30,9 +30,9 @@ jobs:
       R2_HEALTH_KEY: aquafavorit_rozetka.health.json
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         id: checkout
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         id: python
         with:
           python-version: '3.12'
