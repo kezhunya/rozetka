@@ -136,10 +136,16 @@ jobs:
           previous = json.load(open('previous_state.json', encoding='utf-8'))
           now = datetime.now(timezone.utc).isoformat()
           state = dict(previous)
+          # The deployed scheduler reads generated_at for freshness. Preserve the
+          # actual XML publication separately when a full check finds no changes.
+          published_at = previous.get('xml_published_at') or previous.get('generated_at')
           if comparison['changed']:
-              state.update(generated_at=now, offers=stats['offers'],
+              published_at = now
+              state.update(offers=stats['offers'],
                            controlled_offers=stats['controlled_offers'], bytes=stats['bytes'])
           state.update(refresh_token=decision['refresh_token'],
+                       generated_at=now,
+                       xml_published_at=published_at,
                        last_checked_at=now,
                        last_check_result='published' if comparison['changed'] else 'unchanged',
                        semantic_sha256=comparison['semantic_sha256'])
