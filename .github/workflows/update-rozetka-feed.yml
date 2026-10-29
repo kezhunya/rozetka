@@ -79,12 +79,21 @@ jobs:
           python -c 'import json; s=json.load(open("render_stats.json")); assert s["offers"] >= 40000 and s["controlled_offers"] >= 30000, s'
           test "$(wc -c < aquafavorit_rozetka.xml)" -ge 180000000
 
+      - name: Compare product content with published XML
+        id: compare
+        if: steps.decision.outputs.run == 'true'
+        run: |
+          python compare_feed.py --rendered aquafavorit_rozetka.xml \
+            --previous-state previous_state.json \
+            --public-url "$PUBLIC_R2_BASE/$R2_OBJECT_KEY" \
+            --output comparison.json
+
       - name: Install R2 client
         id: install_r2
         if: steps.decision.outputs.run == 'true'
         run: python -m pip install awscli
 
-      - name: Publish only new Rozetka objects
+      - name: Publish changed XML or record unchanged content
         id: publish_r2
         if: steps.decision.outputs.run == 'true'
         env:
@@ -101,27 +110,39 @@ jobs:
             fi
           done
           endpoint="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 cp aquafavorit_rozetka.xml "s3://${CF_R2_BUCKET_NAME}/${R2_OBJECT_KEY}" \
-            --endpoint-url "$endpoint" --no-progress \
-            --content-type 'application/xml; charset=utf-8' \
-            --cache-control 'no-store, max-age=0'
+          changed=$(python -c 'import json; print(str(json.load(open("comparison.json"))["changed"]).lower())')
+          if [ "$changed" = true ]; then
+            aws s3 cp aquafavorit_rozetka.xml "s3://${CF_R2_BUCKET_NAME}/${R2_OBJECT_KEY}" \
+              --endpoint-url "$endpoint" --no-progress \
+              --content-type 'application/xml; charset=utf-8' \
+              --cache-control 'no-store, max-age=0'
+          fi
           remote_size=$(aws s3api head-object --bucket "$CF_R2_BUCKET_NAME" \
             --key "$R2_OBJECT_KEY" --endpoint-url "$endpoint" \
             --query ContentLength --output text)
-          local_size=$(wc -c < aquafavorit_rozetka.xml)
-          test "$remote_size" -eq "$local_size"
+          if [ "$changed" = true ]; then
+            local_size=$(wc -c < aquafavorit_rozetka.xml)
+            test "$remote_size" -eq "$local_size"
+          else
+            previous_size=$(python -c 'import json; print(json.load(open("previous_state.json"))["bytes"])')
+            test "$remote_size" -eq "$previous_size"
+          fi
           python - <<'PY'
           import json
           from datetime import datetime, timezone
           decision = json.load(open('decision.json', encoding='utf-8'))
           stats = json.load(open('render_stats.json', encoding='utf-8'))
-          state = {
-              'generated_at': datetime.now(timezone.utc).isoformat(),
-              'refresh_token': decision['refresh_token'],
-              'offers': stats['offers'],
-              'controlled_offers': stats['controlled_offers'],
-              'bytes': stats['bytes'],
-          }
+          comparison = json.load(open('comparison.json', encoding='utf-8'))
+          previous = json.load(open('previous_state.json', encoding='utf-8'))
+          now = datetime.now(timezone.utc).isoformat()
+          state = dict(previous)
+          if comparison['changed']:
+              state.update(generated_at=now, offers=stats['offers'],
+                           controlled_offers=stats['controlled_offers'], bytes=stats['bytes'])
+          state.update(refresh_token=decision['refresh_token'],
+                       last_checked_at=now,
+                       last_check_result='published' if comparison['changed'] else 'unchanged',
+                       semantic_sha256=comparison['semantic_sha256'])
           with open('publication_state.json', 'w', encoding='utf-8') as stream:
               json.dump(state, stream, ensure_ascii=False)
           PY
@@ -129,7 +150,7 @@ jobs:
             --endpoint-url "$endpoint" --no-progress \
             --content-type 'application/json; charset=utf-8' \
             --cache-control 'no-store, max-age=0'
-          echo "Published $remote_size bytes to $PUBLIC_R2_BASE/$R2_OBJECT_KEY"
+          echo "Content changed: $changed; XML size: $remote_size bytes"
 
       - name: Report result for the control sheet
         if: always() && (steps.decision.outputs.run == 'true' || failure())
@@ -141,8 +162,10 @@ jobs:
           STEP_DECISION: ${{ steps.decision.outcome }}
           STEP_DOWNLOAD: ${{ steps.download.outcome }}
           STEP_RENDER: ${{ steps.render.outcome }}
+          STEP_COMPARE: ${{ steps.compare.outcome }}
           STEP_INSTALL_R2: ${{ steps.install_r2.outcome }}
           STEP_PUBLISH_R2: ${{ steps.publish_r2.outcome }}
+          CONTENT_CHANGED: ${{ steps.compare.outputs.changed }}
           AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
@@ -162,18 +185,21 @@ jobs:
               ('decision', 'Решение об обновлении'),
               ('download', 'Загрузка исходного XML'),
               ('render', 'Расчёт и проверка итогового XML'),
+              ('compare', 'Сравнение содержимого XML'),
               ('install_r2', 'Подготовка клиента R2'),
-              ('publish_r2', 'Публикация в R2'),
+              ('publish_r2', 'Публикация XML или запись результата сверки в R2'),
           ]
           failed = next(((key, title) for key, title in stages
                          if os.getenv('STEP_' + key.upper()) == 'failure'), None)
-          result = 'success' if os.environ['JOB_RESULT'] == 'success' else 'failure'
+          result = ('success' if os.environ.get('CONTENT_CHANGED') == 'true' else 'unchanged') \
+              if os.environ['JOB_RESULT'] == 'success' else 'failure'
           stage = failed[1] if failed else ('Неизвестный этап' if result == 'failure' else '')
           descriptions = {
               'controls': 'Не удалось прочитать таблицу или текущее состояние R2.',
               'decision': 'Не удалось сравнить запрос с опубликованным фидом.',
               'download': 'Не удалось скачать исходный XML сайта либо его размер меньше 180 МБ.',
               'render': 'Ошибка расчёта, проверки XML или количества товаров.',
+              'compare': 'Не удалось сравнить готовый XML с опубликованным.',
               'install_r2': 'Не удалось подготовить клиент R2.',
               'publish_r2': 'Не удалось записать или проверить XML и состояние в R2.',
           }
@@ -182,7 +208,7 @@ jobs:
               'result': result,
               'stage': stage,
               'message': descriptions.get(failed[0], 'Откройте журнал запуска для деталей.')
-                         if failed else '',
+                         if failed else ('XML проверен: содержимое не изменилось.' if result == 'unchanged' else ''),
               'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
           }
           with open('publication_health.json', 'w', encoding='utf-8') as stream:
