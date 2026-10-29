@@ -3,22 +3,23 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-def read_token(path: Path) -> str:
+def read_marker(path: Path) -> str:
+    import csv
     with path.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if "refresh_token" not in (reader.fieldnames or []):
             raise ValueError("Public control CSV lacks refresh_token")
-        first = next(reader, None)
-        if not first:
-            raise ValueError("Public control CSV contains no products")
-        return first["refresh_token"].strip()
+        for row in reader:
+            token = (row.get("refresh_token") or "").strip()
+            if token:
+                return token
+    raise ValueError("Public control CSV contains no refresh_token")
 
 
 def main() -> None:
@@ -29,23 +30,26 @@ def main() -> None:
     parser.add_argument("--max-age-hours", type=float, default=3)
     args = parser.parse_args()
 
-    token = read_token(args.controls_csv)
+    token = read_marker(args.controls_csv)
     try:
         state = json.loads(args.state_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
     try:
-        generated_at = datetime.fromisoformat(state["generated_at"].replace("Z", "+00:00"))
+        checked_at = datetime.fromisoformat(
+            (state.get("last_checked_at") or state["generated_at"]).replace("Z", "+00:00"))
     except (KeyError, TypeError, ValueError):
-        generated_at = datetime.min.replace(tzinfo=timezone.utc)
+        checked_at = datetime.min.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     forced = (os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
               and os.environ.get("ROZETKA_FORCE_REFRESH", "true").lower() == "true")
     marker_changed = token != state.get("refresh_token")
-    expired = now - generated_at >= timedelta(hours=args.max_age_hours)
+    expired = now - checked_at >= timedelta(hours=args.max_age_hours)
+    full_build = forced or marker_changed or expired
     decision = {
-        "run": forced or marker_changed or expired,
-        "reason": "manual" if forced else "marker" if marker_changed else "age" if expired else "unchanged",
+        "run": full_build,
+        "reason": "manual" if forced else "new_request" if marker_changed
+                  else "age_check" if expired else "unchanged",
         "refresh_token": token,
         "checked_at": now.isoformat(),
     }
