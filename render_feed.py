@@ -1,4 +1,4 @@
-"""Stream the site's Rozetka XML through prices/stock from the control sheet."""
+"""Stream the site's Rozetka XML through prices and stock from the control sheet."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 
 OFFER_OPEN = re.compile(rb'^\s*<offer\b[^>]*\bid="([^"]+)"')
 PRICE = re.compile(rb'(<price>)[^<]*(</price>)')
+PRICE_OLD = re.compile(rb'<price_old(?:\s[^>]*)?>[^<]*</price_old>|<price_old\s*/>')
 STOCK = re.compile(rb'(<stock_quantity>)[^<]*(</stock_quantity>)')
 TWO = Decimal("0.01")
 
@@ -26,6 +27,7 @@ class Control:
     stock: str
     rate: Decimal | None = None
     markup: Decimal = Decimal(0)
+    old_price: Decimal | None = None
 
 
 def decimal(value: object, default: Decimal | None = None) -> Decimal | None:
@@ -60,22 +62,26 @@ def load_sheet(path: Path) -> tuple[dict[str, Control], dict[str, Decimal]]:
             continue
         # The legacy table contains one duplicated SKU; its last row controls
         # the existing feed, so keep the same precedence.
-        discount = decimal(cell(row, 17), Decimal(0)) or Decimal(0)
+        discount = decimal(cell(row, 18), Decimal(0)) or Decimal(0)
         if discount < 0 or discount > 100:
             raise ValueError(f"Invalid discount for SKU {sku}: {discount}")
-        stock = cell(row, 22)
+        stock = cell(row, 23)
         if stock not in ("0", "1", "999"):
-            stock = {"Нет в наличии": "0", "Заканчивается": "1", "В наличии": "999"}.get(cell(row, 14), "")
-        markup = decimal(cell(row, 21), Decimal(0)) or Decimal(0)
+            stock = {"Нет в наличии": "0", "Заканчивается": "1", "В наличии": "999"}.get(cell(row, 15), "")
+        markup = decimal(cell(row, 22), Decimal(0)) or Decimal(0)
         if markup < 0:
             raise ValueError(f"Invalid markup for SKU {sku}: {markup}")
-        controls[sku] = Control(rrp, cell(row, 13) or "UAH", discount, stock, markup=markup)
+        old_price = decimal(cell(row, 12))
+        if old_price is not None and old_price < 0:
+            raise ValueError(f"Invalid old price for SKU {sku}: {old_price}")
+        controls[sku] = Control(rrp, cell(row, 13) or "UAH", discount, stock,
+                                markup=markup, old_price=old_price or None)
     return controls, rates
 
 
 def load_controls_csv(path: Path) -> tuple[dict[str, Control], dict[str, Decimal]]:
     controls: dict[str, Control] = {}
-    required = {"article", "rrp", "currency", "discount", "stock_quantity", "rate", "markup"}
+    required = {"article", "rrp", "currency", "discount", "stock_quantity", "rate", "markup", "old_price"}
     with path.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if not required.issubset(reader.fieldnames or []):
@@ -89,6 +95,7 @@ def load_controls_csv(path: Path) -> tuple[dict[str, Control], dict[str, Decimal
             currency = row["currency"] or "UAH"
             rate = Decimal(1) if currency == "UAH" else decimal(row["rate"])
             markup = decimal(row["markup"], Decimal(0))
+            old_price = decimal(row["old_price"])
             stock = row["stock_quantity"]
             if rrp is None or rrp < 0 or discount is None or not (0 <= discount <= 100):
                 raise ValueError(f"Invalid price/discount at CSV line {line_number}, SKU {sku}")
@@ -96,21 +103,33 @@ def load_controls_csv(path: Path) -> tuple[dict[str, Control], dict[str, Decimal
                 raise ValueError(f"Missing currency rate at CSV line {line_number}, SKU {sku}")
             if markup is None or markup < 0:
                 raise ValueError(f"Invalid markup at CSV line {line_number}, SKU {sku}")
+            if old_price is not None and old_price < 0:
+                raise ValueError(f"Invalid old price at CSV line {line_number}, SKU {sku}")
             if stock not in ("", "0", "1", "999"):
                 raise ValueError(f"Invalid stock at CSV line {line_number}, SKU {sku}")
-            controls[sku] = Control(rrp, currency, discount, stock, rate, markup)
+            controls[sku] = Control(rrp, currency, discount, stock, rate, markup, old_price or None)
     if len(controls) < 1000:
         raise ValueError(f"Control CSV contains only {len(controls)} SKUs; refusing incomplete feed")
     return controls, {}
 
 
-def new_price(control: Control, rates: dict[str, Decimal]) -> bytes:
+def calculated_prices(control: Control, rates: dict[str, Decimal]) -> tuple[bytes, bytes | None]:
     rate = Decimal(1) if control.currency == "UAH" else (control.rate or rates.get(control.currency))
     if rate is None:
         raise ValueError(f"Missing currency rate for {control.currency}")
     price = (control.rrp * (Decimal(1) - control.discount / Decimal(100))
              * (Decimal(1) + control.markup / Decimal(100)) * rate)
-    return str(price.quantize(TWO, rounding=ROUND_HALF_EVEN)).encode("ascii")
+    current = price.quantize(TWO, rounding=ROUND_HALF_EVEN)
+    if control.old_price is None:
+        return str(current).encode("ascii"), None
+    old_base = max(control.old_price, control.rrp)
+    old = (old_base * (Decimal(1) + control.markup / Decimal(100)) * rate)
+    old = max(old.quantize(TWO, rounding=ROUND_HALF_EVEN), current)
+    return str(current).encode("ascii"), str(old).encode("ascii")
+
+
+def new_price(control: Control, rates: dict[str, Decimal]) -> bytes:
+    return calculated_prices(control, rates)[0]
 
 
 def transform_offer(data: bytes, controls: dict[str, Control], rates: dict[str, Decimal]) -> tuple[bytes, bool]:
@@ -123,7 +142,16 @@ def transform_offer(data: bytes, controls: dict[str, Control], rates: dict[str, 
         return data, False
     if not PRICE.search(data):
         raise ValueError(f"Offer {sku} lacks <price>")
-    data = PRICE.sub(lambda m: m.group(1) + new_price(control, rates) + m.group(2), data, count=1)
+    price, old_price = calculated_prices(control, rates)
+    data = PRICE.sub(lambda m: m.group(1) + price + m.group(2), data, count=1)
+    if old_price is None:
+        data = PRICE_OLD.sub(b"", data, count=1)
+    else:
+        tag = b"<price_old>" + old_price + b"</price_old>"
+        if PRICE_OLD.search(data):
+            data = PRICE_OLD.sub(lambda _m: tag, data, count=1)
+        else:
+            data = PRICE.sub(lambda m: m.group(0) + tag, data, count=1)
     if control.stock:
         if not STOCK.search(data):
             raise ValueError(f"Offer {sku} lacks <stock_quantity>")
